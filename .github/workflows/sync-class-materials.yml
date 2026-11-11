@@ -1,0 +1,181 @@
+name: Sync Class Materials
+
+on:
+  # Button: Actions → Sync Class Materials → Run workflow
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview changes without committing"
+        type: boolean
+        default: false
+  # Optional weekly pull (Mondays 08:00 UTC)
+  schedule:
+    - cron: "0 8 * * 1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-class-materials
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout student repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch latest class materials
+        run: |
+          set -euo pipefail
+          CLASS_REPO="https://github.com/dina-deifallah/data-viz-class-material-w2026.git"
+          rm -rf /tmp/class-materials
+          git clone --depth 1 --branch main "$CLASS_REPO" /tmp/class-materials
+
+      - name: Sync files (preserve completed exercises)
+        id: sync
+        env:
+          # inputs.* only exist on workflow_dispatch; schedule always commits
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import hashlib
+          import json
+          import os
+          import shutil
+          from pathlib import Path
+
+          student = Path(".").resolve()
+          class_root = Path("/tmp/class-materials").resolve()
+          dry_run = os.environ.get("DRY_RUN") == "1"
+
+          skip_names = {".git", ".github", "LICENSE", "README.md"}
+          skip_prefixes = (".git/", ".github/")
+
+          def is_skipped(rel: Path) -> bool:
+              parts = rel.parts
+              if not parts:
+                  return True
+              if parts[0] in skip_names:
+                  return True
+              s = rel.as_posix()
+              return s.startswith(skip_prefixes)
+
+          def file_md5(path: Path) -> str:
+              h = hashlib.md5()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def looks_incomplete_exercise(path: Path) -> bool:
+              """Keep student work when the notebook no longer has placeholders."""
+              try:
+                  text = path.read_text(encoding="utf-8", errors="ignore")
+              except OSError:
+                  return True
+              if "YOUR CODE HERE" in text:
+                  return True
+              # Non-notebook or unreadable → treat as safe to refresh
+              if path.suffix != ".ipynb":
+                  return True
+              try:
+                  nb = json.loads(text)
+              except json.JSONDecodeError:
+                  return True
+              code_cells = [c for c in nb.get("cells", []) if c.get("cell_type") == "code"]
+              nonempty = 0
+              for c in code_cells:
+                  src = c.get("source", [])
+                  src_text = "".join(src) if isinstance(src, list) else str(src)
+                  lines = [
+                      ln
+                      for ln in src_text.splitlines()
+                      if ln.strip() and not ln.strip().startswith("#")
+                  ]
+                  if lines:
+                      nonempty += 1
+              # Heuristic: mostly empty starter → allow overwrite
+              return nonempty <= max(1, len(code_cells) // 3)
+
+          copied = []
+          skipped_exercises = []
+          unchanged = 0
+
+          for src in class_root.rglob("*"):
+              if not src.is_file():
+                  continue
+              rel = src.relative_to(class_root)
+              if is_skipped(rel):
+                  continue
+              # Ignore notebook checkpoints from upstream if any
+              if ".ipynb_checkpoints" in rel.parts:
+                  continue
+
+              dest = student / rel
+              is_exercise = rel.name.endswith("_exercise.ipynb")
+
+              if is_exercise and dest.exists() and not looks_incomplete_exercise(dest):
+                  skipped_exercises.append(rel.as_posix())
+                  continue
+
+              if dest.exists() and file_md5(dest) == file_md5(src):
+                  unchanged += 1
+                  continue
+
+              copied.append(rel.as_posix())
+              if not dry_run:
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(src, dest)
+
+          summary = {
+              "dry_run": dry_run,
+              "copied_or_would_copy": len(copied),
+              "unchanged": unchanged,
+              "preserved_exercises": skipped_exercises,
+              "files": copied,
+          }
+          print(json.dumps(summary, indent=2))
+
+          out = Path(os.environ["GITHUB_OUTPUT"])
+          has_changes = "true" if copied else "false"
+          with out.open("a", encoding="utf-8") as f:
+              f.write(f"has_changes={has_changes}\n")
+              f.write(f"copied_count={len(copied)}\n")
+              f.write(f"preserved_count={len(skipped_exercises)}\n")
+          PY
+
+      - name: Commit and push
+        if: >-
+          steps.sync.outputs.has_changes == 'true' &&
+          !(github.event_name == 'workflow_dispatch' && inputs.dry_run == true)
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+          git commit -m "Sync new class materials from data-viz-class-material-w2026"
+          git push origin HEAD:${{ github.ref_name }}
+
+      - name: Summary
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && '1' || '0' }}
+        run: |
+          echo "### Sync Class Materials" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Changes detected: \`${{ steps.sync.outputs.has_changes }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Files copied: \`${{ steps.sync.outputs.copied_count }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Completed exercises preserved: \`${{ steps.sync.outputs.preserved_count }}\`" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$DRY_RUN" = "1" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "_Dry run — no commit was made._" >> "$GITHUB_STEP_SUMMARY"
+          fi
