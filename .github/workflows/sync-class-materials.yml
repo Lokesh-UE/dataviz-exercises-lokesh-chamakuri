@@ -1,7 +1,8 @@
-name: Sync Class Materials
+name: Sync fork
 
 on:
-  # Button: Actions → Sync Class Materials → Run workflow
+  # Button: Actions → Sync fork → Run workflow
+  # Parent: https://github.com/dina-deifallah/data-viz-class-material-w2026
   workflow_dispatch:
     inputs:
       dry_run:
@@ -16,7 +17,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: sync-class-materials
+  group: sync-fork
   cancel-in-progress: false
 
 jobs:
@@ -29,12 +30,12 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Fetch latest class materials
+      - name: Fetch parent repo
         run: |
           set -euo pipefail
-          CLASS_REPO="https://github.com/dina-deifallah/data-viz-class-material-w2026.git"
+          PARENT_REPO="https://github.com/dina-deifallah/data-viz-class-material-w2026.git"
           rm -rf /tmp/class-materials
-          git clone --depth 1 --branch main "$CLASS_REPO" /tmp/class-materials
+          git clone --depth 1 --branch main "$PARENT_REPO" /tmp/class-materials
 
       - name: Sync files (preserve completed exercises)
         id: sync
@@ -170,7 +171,7 @@ jobs:
         env:
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && '1' || '0' }}
         run: |
-          echo "### Sync Class Materials" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Sync fork" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- Changes detected: \`${{ steps.sync.outputs.has_changes }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Files copied: \`${{ steps.sync.outputs.copied_count }}\`" >> "$GITHUB_STEP_SUMMARY"
